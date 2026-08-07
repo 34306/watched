@@ -1,6 +1,6 @@
 Package: com.34306.watched
 Name: watched
-Version: 1.1
+Version: 2.0
 Architecture: iphoneos-arm
 Description: Paired your Apple Watch on new watchOS with older iOS
 Maintainer: Little 34306
