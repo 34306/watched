@@ -1,43 +1,182 @@
 #import <Foundation/Foundation.h>
+#import <dlfcn.h>
+#import <unistd.h>
 
-@interface watched : NSObject
-@end
+static const NSInteger kAlignedMajorVersion = 26;
+static const NSInteger kWatchOSToIOSOffset = 7;
 
-@implementation watched
+static const long long kMaxPairingVersion = 999;
+static const long long kMinPairingVersion = 1;
 
-- (void)addNewItemsToPlistWithPath:(NSString *)plistPath key:(NSString *)key value:(id)value {
-    NSMutableDictionary *plistDictionary = [NSMutableDictionary dictionaryWithContentsOfFile:plistPath];
+static NSString *const kNanoRegistryDomain = @"com.apple.NanoRegistry";
+static NSString *const kPairedSyncDomain = @"com.apple.pairedsync";
 
-    if (plistDictionary == nil) {
-        NSLog(@"Failed to load plist file at path: %@", plistPath);
-        return;
-    }
+#pragma mark - Preference method
 
-    [plistDictionary setObject:value forKey:key];
+static BOOL WritePreference(NSString *domain, NSString *key, id value) {
+	CFStringRef cfDomain = (__bridge CFStringRef)domain;
+	CFStringRef cfKey = (__bridge CFStringRef)key;
 
-    if (![plistDictionary writeToFile:plistPath atomically:YES]) {
-        NSLog(@"Failed to write plist file at path: %@", plistPath);
-    } else {
-        NSLog(@"Successfully added items to plist file: %@", plistPath);
-    }
+	CFPropertyListRef current = CFPreferencesCopyValue(cfKey, cfDomain, CFSTR("mobile"), kCFPreferencesAnyHost);
+	BOOL unchanged = current && CFEqual(current, (__bridge CFTypeRef)value);
+	if (current) CFRelease(current);
+	if (unchanged) return NO;
+
+	CFPreferencesSetValue(cfKey, (__bridge CFPropertyListRef)value, cfDomain, CFSTR("mobile"), kCFPreferencesAnyHost);
+	return YES;
 }
 
+static void FlushPreferenceCache(NSString *domain) {
+	static void (*flush)(CFStringRef, CFStringRef);
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		flush = (void (*)(CFStringRef, CFStringRef))dlsym(RTLD_DEFAULT, "_CFPreferencesFlushCachesForIdentifier");
+	});
+	if (flush) flush((__bridge CFStringRef)domain, CFSTR("mobile"));
+}
+
+static void ApplyPairingPreferences(void) {
+	if (geteuid() != 501) return;
+
+	BOOL changed = NO;
+	changed |= WritePreference(kNanoRegistryDomain, @"minPairingCompatibilityVersion", @(kMinPairingVersion));
+	changed |= WritePreference(kNanoRegistryDomain, @"maxPairingCompatibilityVersion", @(kMaxPairingVersion));
+	changed |= WritePreference(kNanoRegistryDomain, @"minPairingCompatibilityVersionWithChipID", @(kMinPairingVersion));
+	changed |= WritePreference(kNanoRegistryDomain, @"minQuickSwitchCompatibilityVersion", @(kMinPairingVersion));
+	changed |= WritePreference(kNanoRegistryDomain, @"IOS_PAIRING_EOL_MIN_PAIRING_COMPATIBILITY_VERSION_CHIPIDS", @"");
+
+	if (changed) {
+		CFPreferencesSynchronize((__bridge CFStringRef)kNanoRegistryDomain, CFSTR("mobile"), kCFPreferencesAnyHost);
+		FlushPreferenceCache(kNanoRegistryDomain);
+	}
+
+	if (WritePreference(kPairedSyncDomain, @"activityTimeout", @30)) {
+		CFPreferencesSynchronize((__bridge CFStringRef)kPairedSyncDomain, CFSTR("mobile"), kCFPreferencesAnyHost);
+		FlushPreferenceCache(kPairedSyncDomain);
+	}
+}
+
+#pragma mark - Runtime method
+
+@interface NRPairingCompatibilityVersionInfo : NSObject
 @end
 
+@interface NRDevice : NSObject
+- (id)valueForProperty:(id)property;
+@end
+
+@interface NRMutableDevice : NRDevice
+@end
+
+@interface ACXRemoteApplication : NSObject
+@end
+
+static NSString *NanoRegistryPropertyKey(const char *symbol) {
+	void *address = dlsym(RTLD_DEFAULT, symbol);
+	return address ? *(NSString *__unsafe_unretained *)address : nil;
+}
+
+//pair photo stuff
+static BOOL DeviceRunsNewerOSThanHost(NRDevice *device) {
+	static NSString *marketingKey, *systemKey;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		marketingKey = NanoRegistryPropertyKey("NRDevicePropertyMarketingVersion");
+		systemKey = NanoRegistryPropertyKey("NRDevicePropertySystemVersion");
+	});
+
+	id version = marketingKey ? [device valueForProperty:marketingKey] : nil;
+	if (![version isKindOfClass:NSString.class] && systemKey) {
+		version = [device valueForProperty:systemKey];
+	}
+	if (![version isKindOfClass:NSString.class]) return NO;
+
+	NSInteger major = [(NSString *)version integerValue];
+	if (major <= 0) return NO;
+	if (major < kAlignedMajorVersion) major += kWatchOSToIOSOffset;
+
+	return major > NSProcessInfo.processInfo.operatingSystemVersion.majorVersion;
+}
+
+%group DeviceCapabilities
+%hook NRDevice
+- (BOOL)supportsCapability:(id)capability {
+	return %orig ?: DeviceRunsNewerOSThanHost(self);
+}
+%end
+
+%hook NRMutableDevice
+- (BOOL)supportsCapability:(id)capability {
+	return %orig ?: DeviceRunsNewerOSThanHost(self);
+}
+%end
+%end
+
+%group AppInstall
+%hook ACXRemoteApplication
+//sync
+- (BOOL)isRuntimeCompatibleWithOSVersion:(id)version {
+	return YES;
+}
+%end
+%end
+
+%group PairingGate
+%hook NRPairingCompatibilityVersionInfo
+//fix pair ig
+- (long long)maxPairingCompatibilityVersion {
+	return kMaxPairingVersion;
+}
+
+- (long long)minPairingCompatibilityVersion {
+	return kMinPairingVersion;
+}
+
+- (long long)minPairingCompatibilityVersionWithChipID {
+	return kMinPairingVersion;
+}
+
+- (long long)minQuickSwitchCompatibilityVersion {
+	return kMinPairingVersion;
+}
+
+- (long long)minPairingCompatibilityVersionForChipID:(id)chipID {
+	return kMinPairingVersion;
+}
+
+- (long long)minPairingCompatibilityVersionForChipID:(id)chipID name:(id)name defaultVersion:(long long)version {
+	return kMinPairingVersion;
+}
+
+- (long long)minQuickSwitchPairingCompatibilityVersionForChipID:(id)chipID {
+	return kMinPairingVersion;
+}
+
+- (long long)minPairingCompatibilityVersionForWatchProductType:(id)productType {
+	return kMinPairingVersion;
+}
+
+- (long long)maxPairingCompatibilityVersionForPhoneProductType:(id)productType {
+	return kMaxPairingVersion;
+}
+
+- (unsigned long long)pairingCompatibilitySupportStateForAdvertisingWatchVersion:(long long)version {
+	return 1;
+}
+%end
+%end
+
 %ctor {
-    //require respring to apply the tweak working.
-    watched *tweak = [[watched alloc] init];
-
-    //first file
-    NSString *firstPlistPath = @"/var/mobile/Library/Preferences/com.apple.NanoRegistry.plist";
-    [tweak addNewItemsToPlistWithPath:firstPlistPath key:@"minPairingCompatibilityVersion" value:@(1)];
-    //if apple update more watchOS, set maxPairingCompatibilityVersion to higher number (example: 9.5.1 around 27 then +2 for each big version, now lastest is 10.3.1 then it's 35~37)
-    [tweak addNewItemsToPlistWithPath:firstPlistPath key:@"maxPairingCompatibilityVersion" value:@(37)];
-    [tweak addNewItemsToPlistWithPath:firstPlistPath key:@"IOS_PAIRING_EOL_MIN_PAIRING_COMPATIBILITY_VERSION_CHIPIDS" value:@""];
-    [tweak addNewItemsToPlistWithPath:firstPlistPath key:@"minPairingCompatibilityVersionWithChipID" value:@(1)];
-
-    //second file
-    NSString *secondPlistPath = @"/var/mobile/Library/Preferences/com.apple.pairedsync.plist";
-    //maybe the same as the 37
-    [tweak addNewItemsToPlistWithPath:secondPlistPath key:@"activityTimeout" value:@(35)];
+	@autoreleasepool {
+		if (NSClassFromString(@"NRPairingCompatibilityVersionInfo")) {
+			%init(PairingGate);
+		}
+		if (NSClassFromString(@"NRDevice")) {
+			%init(DeviceCapabilities);
+		}
+		if (NSClassFromString(@"ACXRemoteApplication")) {
+			%init(AppInstall);
+		}
+		ApplyPairingPreferences();
+	}
 }
